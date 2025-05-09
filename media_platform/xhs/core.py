@@ -108,6 +108,54 @@ class XiaoHongShuCrawler(AbstractCrawler):
 
             utils.logger.info("[XiaoHongShuCrawler.start] Xhs Crawler finished ...")
 
+    async def setup_playwright(self, playwright) -> None:
+        playwright_proxy_format, httpx_proxy_format = None, None
+        if config.ENABLE_IP_PROXY:
+            ip_proxy_pool = await create_ip_pool(
+                config.IP_PROXY_POOL_COUNT, enable_validate_ip=True
+            )
+            ip_proxy_info: IpInfoModel = await ip_proxy_pool.get_proxy()
+            playwright_proxy_format, httpx_proxy_format = self.format_proxy_info(
+                ip_proxy_info
+            )
+
+
+        # Launch a browser context.
+        chromium = playwright.chromium
+        self.browser_context = await self.launch_browser(
+            chromium, None, self.user_agent, headless=config.HEADLESS
+        )
+        # stealth.min.js is a js script to prevent the website from detecting the crawler.
+        await self.browser_context.add_init_script(path="libs/stealth.min.js")
+        # add a cookie attribute webId to avoid the appearance of a sliding captcha on the webpage
+        await self.browser_context.add_cookies(
+            [
+                {
+                    "name": "webId",
+                    "value": "xxx123",  # any value
+                    "domain": ".xiaohongshu.com",
+                    "path": "/",
+                }
+            ]
+        )
+        self.context_page = await self.browser_context.new_page()
+        await self.context_page.goto(self.index_url)
+
+        # Create a client to interact with the xiaohongshu website.
+        self.xhs_client = await self.create_xhs_client(httpx_proxy_format)
+        if not await self.xhs_client.pong():
+            login_obj = XiaoHongShuLogin(
+                login_type=config.LOGIN_TYPE,
+                login_phone="",  # input your phone number
+                browser_context=self.browser_context,
+                context_page=self.context_page,
+                cookie_str=config.COOKIES,
+            )
+            await login_obj.begin()
+            await self.xhs_client.update_cookies(
+                browser_context=self.browser_context
+            )
+
     async def search(self) -> None:
         """Search for notes and retrieve their comment information."""
         utils.logger.info(
@@ -266,6 +314,34 @@ class XiaoHongShuCrawler(AbstractCrawler):
                 await xhs_store.update_xhs_note(note_detail)
         await self.batch_get_note_comments(need_get_comment_note_ids, xsec_tokens)
 
+    async def get_specified_notes_and_return(self, note_url_list=None):
+        """
+        获取指定帖子详情和评论，并返回所有详情数据
+        Args:
+            note_url_list: 可选，帖子链接列表，若为 None 则用 config.XHS_SPECIFIED_NOTE_URL_LIST
+        Returns:
+            List[Dict] 所有帖子详情
+        """
+        get_note_detail_task_list = []
+        note_url_list = note_url_list or config.XHS_SPECIFIED_NOTE_URL_LIST
+        for full_note_url in note_url_list:
+            note_url_info = parse_note_info_from_note_url(full_note_url)
+            crawler_task = self.get_note_detail_async_task(
+                note_id=note_url_info.note_id,
+                xsec_source=note_url_info.xsec_source,
+                xsec_token=note_url_info.xsec_token,
+                semaphore=asyncio.Semaphore(config.MAX_CONCURRENCY_NUM),
+            )
+            get_note_detail_task_list.append(crawler_task)
+
+        note_details = await asyncio.gather(*get_note_detail_task_list)
+        result = []
+        for note_detail in note_details:
+            if note_detail:
+                await xhs_store.update_xhs_note(note_detail)
+                result.append(note_detail)
+        return result
+
     async def get_note_detail_async_task(
         self,
         note_id: str,
@@ -358,6 +434,91 @@ class XiaoHongShuCrawler(AbstractCrawler):
             task_list.append(task)
         await asyncio.gather(*task_list)
 
+    async def batch_get_note_comments_and_return(
+        self, note_list: List[str], xsec_tokens: List[str]
+    ) -> Dict[str, List[Dict]]:
+        """批量获取笔记评论并返回评论数据
+        
+        Args:
+            note_list: 笔记ID列表
+            xsec_tokens: 对应的xsec_token列表
+            
+        Returns:
+            Dict[str, List[Dict]]: 以笔记ID为key，评论列表为value的字典
+        """
+        if not config.ENABLE_GET_COMMENTS:
+            utils.logger.info(
+                f"[XiaoHongShuCrawler.batch_get_note_comments_and_return] Crawling comment mode is not enabled"
+            )
+            return {}
+
+        utils.logger.info(
+            f"[XiaoHongShuCrawler.batch_get_note_comments_and_return] Begin batch get note comments, note list: {note_list}"
+        )
+        
+        result = {}
+        semaphore = asyncio.Semaphore(config.MAX_CONCURRENCY_NUM)
+        task_list: List[Task] = []
+        
+        for index, note_id in enumerate(note_list):
+            task = asyncio.create_task(
+                self.get_comments_and_return(
+                    note_id=note_id, 
+                    xsec_token=xsec_tokens[index], 
+                    semaphore=semaphore
+                ),
+                name=note_id,
+            )
+            task_list.append(task)
+            
+        comments_results = await asyncio.gather(*task_list)
+        
+        # 将结果整理成字典格式
+        for note_id, comments in zip(note_list, comments_results):
+            if comments:
+                result[note_id] = comments
+                
+        return result
+
+    async def get_comments_and_return(
+        self, note_id: str, xsec_token: str, semaphore: asyncio.Semaphore
+    ) -> List[Dict]:
+        """获取笔记评论并返回评论数据
+        
+        Args:
+            note_id: 笔记ID
+            xsec_token: xsec_token
+            semaphore: 信号量控制并发
+            
+        Returns:
+            List[Dict]: 评论列表
+        """
+        async with semaphore:
+            utils.logger.info(
+                f"[XiaoHongShuCrawler.get_comments_and_return] Begin get note id comments {note_id}"
+            )
+
+            if config.ENABLE_IP_PROXY:
+                crawl_interval = random.random()
+            else:
+                crawl_interval = random.uniform(1, config.CRAWLER_MAX_SLEEP_SEC)
+                
+            comments = []
+            
+            async def comment_callback(note_id: str, comment_list: List[Dict]):
+                nonlocal comments
+                comments.extend(comment_list)
+            
+            await self.xhs_client.get_note_all_comments(
+                note_id=note_id,
+                xsec_token=xsec_token,
+                crawl_interval=crawl_interval,
+                callback=comment_callback,
+                max_count=config.CRAWLER_MAX_COMMENTS_COUNT_SINGLENOTES,
+            )
+            
+            return comments
+
     async def get_comments(
         self, note_id: str, xsec_token: str, semaphore: asyncio.Semaphore
     ):
@@ -376,7 +537,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
                 xsec_token=xsec_token,
                 crawl_interval=crawl_interval,
                 callback=xhs_store.batch_update_xhs_note_comments,
-                max_count=CRAWLER_MAX_COMMENTS_COUNT_SINGLENOTES,
+                max_count=config.CRAWLER_MAX_COMMENTS_COUNT_SINGLENOTES,
             )
 
     @staticmethod
