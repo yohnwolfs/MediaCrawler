@@ -136,6 +136,32 @@ async def xhs_search_api(req: XhsSearchRequest, request: Request):
         await crawler.close()
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/xhs_search_completion")
+async def xhs_search_recommend_api(keywords: str, request: Request):
+    keyword_list = keywords.split(",")
+    # 从请求头获取 cookies
+    cookies = request.headers.get("cookie")
+    if cookies:
+        config.COOKIES = cookies
+
+    crawler = XiaoHongShuCrawler()
+    result = []
+    try:
+        async with async_playwright() as playwright:
+            # 初始化爬虫
+            await crawler.setup_playwright(playwright)
+
+            for keyword in keyword_list:
+                r = await crawler.get_search_recommend(keyword)
+                result.append({"keyword": keyword, "items": r["sug_items"]})
+            await crawler.close()
+            return {"status": "ok", "data": result}
+    except Exception as e:
+        traceback.print_exc()
+        await crawler.close()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 if __name__ == '__main__':
     import uvicorn
     uvicorn.run("api_crawler:app", host="0.0.0.0", port=8712, reload=True) 

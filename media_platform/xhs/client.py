@@ -611,3 +611,11 @@ class XiaoHongShuClient(AbstractApiClient):
             return get_note_dict(html)
         except:
             return None
+
+    async def get_search_recommend(self, keyword: str) -> List[Dict]:
+        """
+        获取搜索联想词
+        """
+        uri = "/api/sns/web/v1/search/recommend"
+        data = {"keyword": keyword}
+        return await self.get(uri, data)

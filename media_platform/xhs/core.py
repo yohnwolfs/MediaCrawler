@@ -752,4 +752,8 @@ class XiaoHongShuCrawler(AbstractCrawler):
             videoNum += 1
             await xhs_store.update_xhs_note_image(note_id, content, extension_file_name)
 
-    
+    async def get_search_recommend(self, keyword: str) -> List[Dict]:
+        """
+        获取搜索联想词
+        """
+        return await self.xhs_client.get_search_recommend(keyword)
