@@ -231,6 +231,82 @@ class XiaoHongShuCrawler(AbstractCrawler):
                     )
                     break
 
+    async def search_and_return(self, keywords: str, enable_comments: Optional[bool] = False) -> List[Dict]:
+        """
+        根据传入的关键词进行搜索，返回所有笔记详情数据
+        Args:
+            keywords: 逗号分隔的关键词字符串
+        Returns:
+            List[Dict]: 所有笔记详情
+        """
+        utils.logger.info(
+            "[XiaoHongShuCrawler.search_and_return] Begin search xiaohongshu keywords"
+        )
+        xhs_limit_count = 20  # xhs limit page fixed value
+        result = []
+        start_page = config.START_PAGE
+        for keyword in keywords.split(","):
+            source_keyword_var.set(keyword)
+            utils.logger.info(
+                f"[XiaoHongShuCrawler.search_and_return] Current search keyword: {keyword}"
+            )
+            page = 1
+            search_id = get_search_id()
+            while (
+                page - start_page + 1
+            ) * xhs_limit_count <= config.CRAWLER_MAX_NOTES_COUNT:
+                if page < start_page:
+                    utils.logger.info(f"[XiaoHongShuCrawler.search_and_return] Skip page {page}")
+                    page += 1
+                    continue
+
+                try:
+                    utils.logger.info(
+                        f"[XiaoHongShuCrawler.search_and_return] search xhs keyword: {keyword}, page: {page}"
+                    )
+                    notes_res = await self.xhs_client.get_note_by_keyword(
+                        keyword=keyword,
+                        search_id=search_id,
+                        page=page,
+                        sort=(
+                            SearchSortType(config.SORT_TYPE)
+                            if config.SORT_TYPE != ""
+                            else SearchSortType.GENERAL
+                        ),
+                    )
+                    if not notes_res or not notes_res.get("has_more", False):
+                        utils.logger.info("No more content!")
+                        break
+                    semaphore = asyncio.Semaphore(config.MAX_CONCURRENCY_NUM)
+                    task_list = [
+                        self.get_note_detail_async_task(
+                            note_id=post_item.get("id"),
+                            xsec_source=post_item.get("xsec_source"),
+                            xsec_token=post_item.get("xsec_token"),
+                            semaphore=semaphore,
+                        )
+                        for post_item in notes_res.get("items", {})
+                        if post_item.get("model_type") not in ("rec_query", "hot_query")
+                    ]
+                    note_details = await asyncio.gather(*task_list)
+                    for note_detail in note_details:
+                        if note_detail:
+                            result.append(note_detail)
+                    page += 1
+                except DataFetchError:
+                    utils.logger.error(
+                        "[XiaoHongShuCrawler.search_and_return] Get note detail error"
+                    )
+                    break
+        if enable_comments:
+            comments = await self.batch_get_note_comments_and_return(list(map(lambda x: x.get("note_id"), result)), list(map(lambda x: x.get("xsec_token"), result)))
+            for note_id, comments in comments.items():
+                for note in result:
+                    if note.get("note_id") == note_id:
+                        note["comments"] = comments
+        return result
+
+
     async def get_creators_and_notes(self) -> None:
         """Get creator's notes and retrieve their comment information."""
         utils.logger.info(
@@ -675,3 +751,5 @@ class XiaoHongShuCrawler(AbstractCrawler):
             extension_file_name = f"{videoNum}.mp4"
             videoNum += 1
             await xhs_store.update_xhs_note_image(note_id, content, extension_file_name)
+
+    

@@ -3,7 +3,7 @@
 
 import asyncio
 from typing import List, Optional
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 import config
 from media_platform.xhs.core import XiaoHongShuCrawler
@@ -14,25 +14,28 @@ app = FastAPI()
 
 class XhsDetailRequest(BaseModel):
     note_url_list: List[str]
-    cookies: Optional[str] = None  # 可选，支持自定义 cookie
 
 class XhsCommentsRequest(BaseModel):
     note_ids: List[str]  # 笔记ID列表
     xsec_tokens: List[str]  # 对应的xsec_token列表
-    cookies: Optional[str] = None  # 可选，支持自定义 cookie
     max_comments_count: Optional[int] = 10  # 可选，每个笔记最大评论数量
     enable_get_sub_comments: Optional[bool] = False  # 可选，是否获取子评论
+
+class XhsSearchRequest(BaseModel):
+    keywords: str  # 搜索关键词，多个关键词用逗号分隔
+    sort_type: Optional[str] = None  # 可选，排序方式
+    max_notes_count: Optional[int] = None  # 可选，最大帖子数
 
 @app.get("/")
 async def test():
     return 'api working!'
 
 @app.post("/xhs_detail")
-async def xhs_detail_api(req: XhsDetailRequest):
-
-    # 动态设置 config
-    if req.cookies:
-        config.COOKIES = req.cookies
+async def xhs_detail_api(req: XhsDetailRequest, request: Request):
+    # 从请求头获取 cookies
+    cookies = request.headers.get("cookie")
+    if cookies:
+        config.COOKIES = cookies
     config.CRAWLER_TYPE = "detail"
     config.PLATFORM = "xhs"
     config.XHS_SPECIFIED_NOTE_URL_LIST = req.note_url_list
@@ -53,18 +56,21 @@ async def xhs_detail_api(req: XhsDetailRequest):
             return {"status": "ok", "data": result}
 
     except Exception as e:
+        if hasattr(e, "last_attempt") and "登录已过期" in str(e.last_attempt.exception()):
+            return {"status": "error", "message": "登录已过期"}
         traceback.print_exc()
         await crawler.close()
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/xhs_comments")
-async def xhs_comments_api(req: XhsCommentsRequest):
+async def xhs_comments_api(req: XhsCommentsRequest, request: Request):
     if len(req.note_ids) != len(req.xsec_tokens):
         raise HTTPException(status_code=400, detail="笔记ID列表和xsec_token列表长度必须相同")
         
-    # 动态设置 config
-    if req.cookies:
-        config.COOKIES = req.cookies
+    # 从请求头获取 cookies
+    cookies = request.headers.get("cookie")
+    if cookies:
+        config.COOKIES = cookies
     config.CRAWLER_TYPE = "detail"
     config.PLATFORM = "xhs"
     # 关闭保存到文件，仅返回数据
@@ -91,6 +97,41 @@ async def xhs_comments_api(req: XhsCommentsRequest):
             return {"status": "ok", "data": results}
   
     except Exception as e:
+        if hasattr(e, "last_attempt") and "登录已过期" in str(e.last_attempt.exception()):
+            return {"status": "error", "message": "登录已过期"}
+        traceback.print_exc()
+        await crawler.close()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/xhs_search")
+async def xhs_search_api(req: XhsSearchRequest, request: Request):
+    # 从请求头获取 cookies
+    cookies = request.headers.get("cookie")
+    if cookies:
+        config.COOKIES = cookies
+    config.CRAWLER_TYPE = "search"
+    config.PLATFORM = "xhs"
+    # 排序方式
+    if req.sort_type:
+        config.SORT_TYPE = req.sort_type
+    # 最大帖子数
+    if req.max_notes_count:
+        config.CRAWLER_MAX_NOTES_COUNT = req.max_notes_count
+    # 关闭保存到文件，仅返回数据
+    config.SAVE_DATA_OPTION = "json"
+
+    crawler = XiaoHongShuCrawler()
+    try:
+        async with async_playwright() as playwright:
+            # 初始化爬虫
+            await crawler.setup_playwright(playwright)
+            # 搜索并返回数据
+            result = await crawler.search_and_return(keywords=req.keywords, enable_comments=True)
+            await crawler.close()
+            return {"status": "ok", "data": result}
+    except Exception as e:
+        if hasattr(e, "last_attempt") and "登录已过期" in str(e.last_attempt.exception()):
+            return {"status": "error", "message": "登录已过期"}
         traceback.print_exc()
         await crawler.close()
         raise HTTPException(status_code=500, detail=str(e))
