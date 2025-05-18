@@ -136,7 +136,7 @@ async def xhs_search_api(req: XhsSearchRequest, request: Request):
         await crawler.close()
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/xhs_search_completion")
+@app.get("/xhs_search_recommend")
 async def xhs_search_recommend_api(keywords: str, request: Request):
     keyword_list = keywords.split(",")
     # 从请求头获取 cookies
